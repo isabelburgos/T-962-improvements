@@ -567,6 +567,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stepSeconds.setRange(1, 600)
         self.stepSeconds.setValue(10)
         headerLay.addWidget(self.stepSeconds)
+        # Calibration Run button (inserted before Run Built Profile)
+        self.btnRunCalib = QtWidgets.QPushButton("Calibration Run")
+        headerLay.addWidget(self.btnRunCalib)
         self.btnRunBuilt = QtWidgets.QPushButton("Run Built Profile")
         self.btnAbortRun = QtWidgets.QPushButton("Abort")
         self.btnAbortRun.setEnabled(False)
@@ -764,10 +767,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Bake profile runner
         self.btnRunBuilt.clicked.connect(self.on_run_built_profile)
         self.btnAbortRun.clicked.connect(self.on_abort_run_profile)
+        self.btnRunCalib.clicked.connect(self.on_run_calibration)
         self.profileTimer = QtCore.QTimer(self)
         self.profileTimer.timeout.connect(self.on_profile_tick)
         self._run_queue: List[int] = []
         self._run_index: int = 0
+        self._run_kind: Optional[str] = None  # 'auto' for built profile, 'calib' for calibration
+        self._seq_queue: List[Tuple[int,int]] = []  # (setpoint, duration_s) for calibration
+        self._calib_save_path: Optional[str] = None
 
         # Telemetry parsing state (must be set during init)
         self.telemetry_active = False
@@ -831,6 +838,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._run_queue = temps
         self._run_index = 0
+        self._run_kind = 'auto'
         self.transition('START_AUTO')
         # Kick off immediately then every step_s seconds
         self.on_profile_tick()
@@ -842,6 +850,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.state.mode != 'auto':
             return
         self.profileTimer.stop()
+        self._run_kind = None
+        self._seq_queue.clear()
+        self._run_queue.clear()
         try:
             self.send_ascii("stop")
         except Exception:
@@ -894,6 +905,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_profile_tick(self):
         if self.state.mode != 'auto':
             return
+        # Calibration run with variable durations
+        if self._run_kind == 'calib':
+            if self._run_index >= len(self._seq_queue):
+                self.profileTimer.stop()
+                try:
+                    self.send_ascii("stop")
+                except Exception:
+                    pass
+                self.transition('AUTO_COMPLETE')
+                self.log("[CAL] Complete")
+                # Auto-save if user picked a path
+                if self._calib_save_path:
+                    self.save_telemetry_to_path(self._calib_save_path)
+                self._run_kind = None
+                self._seq_queue.clear()
+                return
+            setp, dur = self._seq_queue[self._run_index]
+            self.send_ascii(f"bake {setp} {int(dur)}")
+            self._run_index += 1
+            # Wait exactly the specified duration before next step
+            self.profileTimer.start(int(dur * 1000))
+            return
+        # Built-profile auto run (uniform step time)
         if self._run_index >= len(self._run_queue):
             self.profileTimer.stop()
             try:
@@ -902,12 +936,61 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self.transition('AUTO_COMPLETE')
             self.log("[RUN] Complete")
+            self._run_kind = None
             return
         temp = self._run_queue[self._run_index]
         step_s = int(self.stepSeconds.value())
         self.send_ascii(f"bake {temp} {step_s}")
         self._run_index += 1
+        self.profileTimer.start(step_s * 1000)
         self.transition('AUTO_STEP_TICK', index=self._run_index)
+    def on_run_calibration(self):
+        if self.worker is None:
+            self.log("[UI] Not connected")
+            return
+        # Stop any other mode
+        if self.state.mode == 'manual':
+            self.on_manual_stop(log_only=False)
+        if self.state.mode == 'auto':
+            self.on_abort_run_profile()
+        # Clear telemetry so the file contains only this run
+        self._t0_epoch = None
+        self.t0s.clear(); self.actuals.clear(); self.setpoints.clear()
+        self.t0_list.clear(); self.t1_list.clear(); self.t2_list.clear(); self.t3_list.clear()
+        self.heat_list.clear(); self.fan_list.clear(); self.teleRows.clear()
+        # Ask for an output path now (one-click UX). User may cancel and still run.
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"calibration_{ts}.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Telemetry CSV (choose where Calibration Run will write)", default_name, "CSV Files (*.csv)")
+        self._calib_save_path = path if path else None
+        # Build calibration sequence (setpoint, duration_s)
+        self._seq_queue = [
+            (150, 120),  # stabilize at 150°C
+            (165, 60),   # small up-step
+            (150, 60),
+            (135, 60),   # small down-step
+            (150, 60),
+            (120, 120),  # cooling characterization region
+            (150, 60),   # return to mid for closure
+        ]
+        self._run_kind = 'calib'
+        self._run_index = 0
+        self.transition('START_AUTO')
+        self.on_profile_tick()  # send first command immediately
+        self.log("[CAL] Calibration Run started")
+    def save_telemetry_to_path(self, path: str) -> bool:
+        import csv
+        try:
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp_iso", "t_sec", "set_c", "actual_c", "coldj_c", "heat", "fan", "mode", "temp0_c", "temp1_c", "temp2_c", "temp3_c"]) 
+                for row in self.teleRows:
+                    w.writerow(row)
+            self.statusBar().showMessage(f"Saved telemetry: {path}", 5000)
+            return True
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save telemetry: {e}")
+            return False
 
     def configure_plot_axes(self, pw: pg.PlotWidget, disable_mouse: bool = True):
         """Set 0..420 s (x), 0..300 °C (y), lock aspect. If disable_mouse is True,
@@ -979,6 +1062,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnCopyTarget.setEnabled(is_conn)
         self.stepSeconds.setEnabled(is_conn and not manual_active)
         self.btnRunBuilt.setEnabled(is_conn and not manual_active and not auto_active)
+        self.btnRunCalib.setEnabled(is_conn and not manual_active and not auto_active)
         self.btnAbortRun.setEnabled(is_conn and auto_active)
 
         # Manual control
