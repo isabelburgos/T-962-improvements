@@ -41,8 +41,8 @@
 #define TICKS_PER_SECOND (1000 / PID_TIMEBASE)
 
 // Cooling/anti-chatter behavior
-#define COOL_HYSTERESIS_C   (3.0f)   // °C band where neither heater nor extra fan engages
-#define FAN_KP              (30.0f)  // PWM counts per °C above setpoint (tuned empirically)
+#define COOL_HYSTERESIS_C   (4.0f)   // widened deadband for extraction-on operation
+#define FAN_KP              (20.0f)  // reduced proportional gain (extraction increases effective cooling)
 
 static PidType PID;
 
@@ -158,7 +158,7 @@ void Reflow_Init(void) {
 	//PID_init(&PID, 20, 0.04, 25, PID_Direction_Direct); // Improvement as far as I can tell, still work in progress
 	PID_init(&PID, 0, 0, 0, PID_Direction_Direct); // Can't supply tuning to PID_Init when not using the default timebase
 	PID_SetSampleTime(&PID, PID_TIMEBASE);
-	PID_SetTunings(&PID, 20, 0.016, 62.5); // Adjusted values to compensate for the incorrect timebase earlier
+	PID_SetTunings(&PID, 18, 0.012, 40.0); // Tuned for extraction-on operation: slightly lower Kp/Ki and softer D
 	//PID_SetTunings(&PID, 80, 0, 0); // This results in oscillations with 14.5s cycle time
 	//PID_SetTunings(&PID, 30, 0, 0); // This results in oscillations with 14.5s cycle time
 	//PID_SetTunings(&PID, 15, 0, 0);
@@ -314,6 +314,7 @@ int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pf
 
     if (error > COOL_HYSTERESIS_C) {
         // HEATING region (fan at minimum, no reverse fan usage)
+        PID_SetMode(&PID, PID_Mode_Automatic);
         PID.myInput = meastemp;
         PID_Compute(&PID);
         uint32_t out = PID.myOutput;
@@ -323,6 +324,7 @@ int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pf
 
     } else if (error < -COOL_HYSTERESIS_C) {
         // COOLING region (heater off). Use a simple proportional fan control.
+        PID_SetMode(&PID, PID_Mode_Manual);   // prevent I-term windup during explicit cooling
         *pheat = 0;
         float cool_e = -error; // degrees above setpoint
         int fan = (int)(min_fan + FAN_KP * cool_e);
@@ -336,6 +338,7 @@ int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pf
 
     } else {
         // DEADBAND region: avoid fighting around the setpoint
+        PID_SetMode(&PID, PID_Mode_Manual);   // hold integrator steady in deadband
         *pheat = 0;
         *pfan  = min_fan;
         // Nudge PID toward neutral to reduce kick when re-entering heating
