@@ -37,7 +37,12 @@
 // 250ms between each run
 #define PID_TIMEBASE (250)
 
+
 #define TICKS_PER_SECOND (1000 / PID_TIMEBASE)
+
+// Cooling/anti-chatter behavior
+#define COOL_HYSTERESIS_C   (3.0f)   // °C band where neither heater nor extra fan engages
+#define FAN_KP              (30.0f)  // PWM counts per °C above setpoint (tuned empirically)
 
 static PidType PID;
 
@@ -236,69 +241,107 @@ int Reflow_GetTimeLeft(void) {
 }
 
 // returns -1 if the reflow process is done.
+// Control strategy notes:
+//  - Add a ±COOL_HYSTERESIS_C deadband around the setpoint to prevent chatter.
+//  - Cooling uses fan-only proportional control; heater is inhibited while cooling.
+//  - Heating uses the original PID but its output is clamped to the "heater" half
+//    of the combined mapping to avoid reverse-fan commands from PID.
+//  - While cooling or in deadband we bias PID.myOutput to neutral (248) to limit
+//    integral windup and reduce heater kick when leaving cooling.
 int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pfan, int32_t manualsetpoint) {
-	int32_t retval = 0;
+    int32_t retval = 0;
+    float control_setpoint = 0.0f;   // setpoint used for error logic
+    int slope_negative = 0;          // profile descending right now
 
-	if (manualsetpoint) {
-		PID.mySetpoint = (float)manualsetpoint;
+    if (manualsetpoint) {
+        PID.mySetpoint = (float)manualsetpoint;
+        control_setpoint = (float)manualsetpoint;
+        slope_negative = 0; // constant SP in bake mode
+        if (bake_timer > 0 && (Reflow_GetTimeLeft() == 0 || Reflow_GetTimeLeft() == -1)) {
+            retval = -1;
+        }
+    } else {
+        // Figure out what setpoint to use from the profile, brute-force way. Fix this.
+        uint8_t idx = thetime / 10;
+        uint16_t start = idx * 10;
+        uint16_t offset = thetime - start;
+        if (idx < (NUMPROFILETEMPS - 2)) {
+            uint16_t value = Reflow_GetSetpointAtIdx(idx);
+            uint16_t value2 = Reflow_GetSetpointAtIdx(idx + 1);
 
-		if (bake_timer > 0 && (Reflow_GetTimeLeft() == 0 || Reflow_GetTimeLeft() == -1)) {
-			retval = -1;
-		}
-	} else {
-		// Figure out what setpoint to use from the profile, brute-force way. Fix this.
-		uint8_t idx = thetime / 10;
-		uint16_t start = idx * 10;
-		uint16_t offset = thetime - start;
-		if (idx < (NUMPROFILETEMPS - 2)) {
-			uint16_t value = Reflow_GetSetpointAtIdx(idx);
-			uint16_t value2 = Reflow_GetSetpointAtIdx(idx + 1);
+            if (value > 0 && value2 > 0) {
+                uint16_t avg = (value * (10 - offset) + value2 * offset) / 10;
 
-			if (value > 0 && value2 > 0) {
-				uint16_t avg = (value * (10 - offset) + value2 * offset) / 10;
+                // Keep the setpoint for the UI...
+                intsetpoint = avg;
+                if (value2 > avg) {
+                    // Temperature is rising,
+                    // using the future value for PID regulation produces better result when heating
+                    PID.mySetpoint = (float)value2;
+                } else {
+                    // Use the interpolated value when cooling
+                    PID.mySetpoint = (float)avg;
+                }
+                control_setpoint = PID.mySetpoint; // avg or future value as chosen above
+                slope_negative = (value2 < value) ? 1 : 0;
+            } else {
+                control_setpoint = (float)intsetpoint;
+                slope_negative = 0;
+                retval = -1;
+            }
+        } else {
+            control_setpoint = (float)intsetpoint;
+            slope_negative = 0;
+            retval = -1;
+        }
+    }
 
-				// Keep the setpoint for the UI...
-				intsetpoint = avg;
-				if (value2 > avg) {
-					// Temperature is rising,
-					// using the future value for PID regulation produces better result when heating
-					PID.mySetpoint = (float)value2;
-				} else {
-					// Use the interpolated value when cooling
-					PID.mySetpoint = (float)avg;
-				}
-			} else {
-				retval = -1;
-			}
-		} else {
-			retval = -1;
-		}
-	}
+    if (!manualsetpoint) {
+        // Plot actual temperature on top of desired profile
+        int realx = (thetime / 5) + XAXIS;
+        int y = (uint16_t)(meastemp * 0.2f);
+        y = YAXIS - y;
+        LCD_SetPixel(realx, y);
+    }
 
-	if (!manualsetpoint) {
-		// Plot actual temperature on top of desired profile
-		int realx = (thetime / 5) + XAXIS;
-		int y = (uint16_t)(meastemp * 0.2f);
-		y = YAXIS - y;
-		LCD_SetPixel(realx, y);
-	}
+    // --- Unified control with deadband and mutual exclusion ---
+    // When above setpoint by a margin, we cool using the fan only.
+    // When below setpoint by a margin, we heat using the heater only.
+    // Within the deadband, we avoid action to prevent chatter/oscillation.
 
-	PID.myInput = meastemp;
-	PID_Compute(&PID);
-	uint32_t out = PID.myOutput;
-	if (out < 248) { // Fan in reverse
-		*pfan = 255 - out;
-		*pheat = 0;
-	} else {
-		*pheat = out - 248;
+    const float error = control_setpoint - meastemp;   // + => need heat, - => need cooling
+    const uint8_t min_fan = NV_GetConfig(REFLOW_MIN_FAN_SPEED);
 
-		// When heating like crazy make sure we can reach our setpoint
-		// if(*pheat>192) { *pfan=2; } else { *pfan=2; }
+    if (error > COOL_HYSTERESIS_C) {
+        // HEATING region (fan at minimum, no reverse fan usage)
+        PID.myInput = meastemp;
+        PID_Compute(&PID);
+        uint32_t out = PID.myOutput;
+        if (out < 248) out = 248;            // clamp away any cooling command from PID
+        *pheat = (uint8_t)(out - 248);       // 0..255
+        *pfan  = min_fan;                    // low, fixed airflow during heating
 
-		// Run at a low fixed speed during heating for now
-		*pfan = NV_GetConfig(REFLOW_MIN_FAN_SPEED);
-	}
-	return retval;
+    } else if (error < -COOL_HYSTERESIS_C) {
+        // COOLING region (heater off). Use a simple proportional fan control.
+        *pheat = 0;
+        float cool_e = -error; // degrees above setpoint
+        int fan = (int)(min_fan + FAN_KP * cool_e);
+        if (slope_negative && fan < 120) fan = 120;  // ensure useful airflow when profile is descending
+        if (fan > 255) fan = 255;
+        if (fan < 0)   fan = 0;
+        *pfan = (uint8_t)fan;
+
+        // Keep PID from winding up while we are explicitly cooling: bias output to neutral
+        PID.myOutput = 248;  // mid-point in existing mapping
+
+    } else {
+        // DEADBAND region: avoid fighting around the setpoint
+        *pheat = 0;
+        *pfan  = min_fan;
+        // Nudge PID toward neutral to reduce kick when re-entering heating
+        PID.myOutput = 248;
+    }
+    return retval;
 }
 
 void Reflow_ToggleStandbyLogging(void) {
