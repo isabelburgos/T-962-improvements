@@ -1,0 +1,4 @@
+#!/bin/bash
+export PATH="/Applications/ArmGNUToolchain/14.3.rel1/arm-none-eabi/bin:$PATH"
+make
+lpc21isp -hex ./build/T-962-controller.hex /dev/tty.usbserial-BG01OX7L 57600 11059
