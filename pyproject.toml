@@ -1,0 +1,15 @@
+[project]
+name = "reflow"
+version = "0"
+description = "GUI for T-962 reflow oven"
+authors = [
+    {name = "isabelburgos", email = "isabel@nanographs.io"},
+]
+dependencies = [
+    "pyqtgraph>=0.13.7",
+    "PyQt6>=6.7.1",
+    "pyserial>=3.5",
+]
+requires-python = "~=3.11"
+readme = "README.md"
+license = {text = "\"0BSD OR Apache-2.0\""}
