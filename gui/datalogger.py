@@ -12,103 +12,8 @@ import sys, math
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-import serial
-import serial.tools.list_ports as list_ports
-
-# -------------------------------
-# Small ASCII protocol helper
-# -------------------------------
-class AsciiProtocol:
-    def __init__(self, eol: bytes = b"\n"):
-        self.eol = eol
-        self.rx_buf = bytearray()
-
-    def encode(self, line: str) -> bytes:
-        return line.encode("utf-8") + self.eol
-
-    def try_decode_lines(self, chunk: bytes) -> List[str]:
-        out: List[str] = []
-        self.rx_buf.extend(chunk)
-        while True:
-            i = self.rx_buf.find(self.eol)
-            if i < 0:
-                break
-            line = self.rx_buf[:i]
-            del self.rx_buf[: i + len(self.eol)]
-            out.append(line.decode(errors="replace"))
-        return out
-
-
-# --------------------------------------
-# Serial worker thread (non-blocking IO)
-# --------------------------------------
-class SerialWorker(QtCore.QThread):
-    rx_text = QtCore.pyqtSignal(str)
-    rx_raw = QtCore.pyqtSignal(bytes)
-    error = QtCore.pyqtSignal(str)
-    status = QtCore.pyqtSignal(str)
-    connected_changed = QtCore.pyqtSignal(bool)
-
-    def __init__(self, port: str, baud: int, proto: AsciiProtocol, parent=None):
-        super().__init__(parent)
-        self.port = port
-        self.baud = baud
-        self.proto = proto
-        self._ser: Optional[serial.Serial] = None
-        self._run = False
-        self._lock = QtCore.QMutex()
-        self._tx: Deque[bytes] = deque()
-
-    @QtCore.pyqtSlot(bytes)
-    def send_bytes(self, data: bytes):
-        with QtCore.QMutexLocker(self._lock):
-            self._tx.append(data)
-
-    def run(self):
-        try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=0.05, write_timeout=0.5)
-        except Exception as e:
-            self.error.emit(f"Open failed: {e}")
-            self.connected_changed.emit(False)
-            return
-        self.status.emit(f"Opened {self.port} @ {self.baud}")
-        self.connected_changed.emit(True)
-        self._run = True
-        try:
-            while self._run:
-                # write
-                data = None
-                with QtCore.QMutexLocker(self._lock):
-                    if self._tx:
-                        data = self._tx.popleft()
-                if data and self._ser:
-                    try:
-                        self._ser.write(data)
-                    except Exception as e:
-                        self.error.emit(f"Write error: {e}")
-                # read
-                try:
-                    chunk = self._ser.read(4096) if self._ser else b""
-                except Exception as e:
-                    self.error.emit(f"Read error: {e}")
-                    break
-                if chunk:
-                    self.rx_raw.emit(chunk)
-                    for line in self.proto.try_decode_lines(chunk):
-                        self.rx_text.emit(line)
-                else:
-                    self.msleep(5)
-        finally:
-            try:
-                if self._ser and self._ser.is_open:
-                    self._ser.close()
-            except Exception:
-                pass
-            self.connected_changed.emit(False)
-            self.status.emit("Port closed")
-
-    def stop(self):
-        self._run = False
+# Import protocol/serial worker/port list from shared.py
+from shared import AsciiProtocol, SerialWorker, list_serial_ports
 
 
 # -------------------------
@@ -188,9 +93,7 @@ class Datalogger(QtWidgets.QMainWindow):
         cl.addWidget(self.saveBtn)
         # Axes controls
         self.resetAxesBtn = QtWidgets.QPushButton("Reset Axes")
-        self.autoScaleBtn = QtWidgets.QPushButton("Auto Scale")
         cl.addWidget(self.resetAxesBtn)
-        cl.addWidget(self.autoScaleBtn)
         root.addWidget(ctrl)
 
         # Live values (compact grid)
@@ -240,13 +143,12 @@ class Datalogger(QtWidgets.QMainWindow):
         self.stopBtn.clicked.connect(self.on_stop)
         self.saveBtn.clicked.connect(self.on_save_csv)
         self.resetAxesBtn.clicked.connect(self.on_reset_axes)
-        self.autoScaleBtn.clicked.connect(self.on_auto_scale)
 
     # ---------- Port helpers ----------
     def refresh_ports(self):
         sel = self.portCombo.currentText()
         self.portCombo.clear()
-        ports = [p.device for p in list_ports.comports()]
+        ports = list_serial_ports()
         if self.default_port and self.default_port not in ports:
             ports.insert(0, self.default_port)
         self.portCombo.addItems(ports)
@@ -438,7 +340,7 @@ class Datalogger(QtWidgets.QMainWindow):
     def send_ascii(self, line: str):
         if not self.worker:
             self.log("[UI] Not connected"); return
-        self.worker.send_bytes(self.proto.encode(line))
+        self.worker.send(self.proto.encode(line))
         self.log(f"[TX] {line}")
 
     # ---------- Save CSV ----------
@@ -465,18 +367,6 @@ class Datalogger(QtWidgets.QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.logBox.appendPlainText(f"[{ts}] {msg}")
 
-
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    app.setFont(QtGui.QFont("Helvetica", 11))
-    pg.setConfigOptions(antialias=True)
-    w = Datalogger()
-    w.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
     def on_reset_axes(self):
         """Reset plot to fixed 0..300 °C on Y and either 0..420 s or to current max time, whichever is larger."""
         xmax = 420
@@ -495,35 +385,15 @@ if __name__ == "__main__":
         try: vb.setAspectLocked(True, 300/float(xmax))
         except Exception: pass
 
-    def on_auto_scale(self):
-        """Scale X/Y to the data extents with a small padding. Uses Actual/Left/Right series."""
-        if not self.tsec:
-            self.on_reset_axes()
-            return
-        tmin, tmax = 0.0, max(self.tsec)
-        # gather all numeric temps present
-        ys = []
-        for arr in (self.actual, self.left, self.right):
-            ys.extend([v for v in arr if v is not None])
-        if not ys:
-            self.on_reset_axes(); return
-        ymin, ymax = float(min(ys)), float(max(ys))
-        if ymin == ymax:
-            ymin -= 1.0; ymax += 1.0
-        # padding
-        dy = max(3.0, 0.05 * (ymax - ymin))
-        dt = max(1.0, 0.02 * (tmax - tmin))
-        vb = self.plot.getViewBox()
-        try: vb.disableAutoRange()
-        except Exception: pass
-        vb.setLimits(xMin=tmin, xMax=tmax+dt, yMin=ymin-dy, yMax=ymax+dy)
-        self.plot.setXRange(tmin, tmax + dt, padding=0)
-        self.plot.setYRange(ymin - dy, ymax + dy, padding=0)
-        # lock aspect to visible ranges to avoid distortion
-        try:
-            rng = self.plot.viewRange()
-            xw = max(1e-6, rng[0][1]-rng[0][0])
-            yw = max(1e-6, rng[1][1]-rng[1][0])
-            vb.setAspectLocked(True, yw/xw)
-        except Exception:
-            pass
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setFont(QtGui.QFont("Helvetica", 11))
+    pg.setConfigOptions(antialias=True)
+    w = Datalogger()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

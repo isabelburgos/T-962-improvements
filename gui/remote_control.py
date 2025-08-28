@@ -551,6 +551,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # collapsed by default
         self.serialContent.setVisible(False)
 
+        # --- Passive Datalogging ---
+        passiveGroup = QtWidgets.QGroupBox("Passive Datalogging")
+        pl = QtWidgets.QHBoxLayout(passiveGroup)
+        pl.addWidget(QtWidgets.QLabel("Poll every (s):"))
+        self.passiveInterval = QtWidgets.QSpinBox()
+        self.passiveInterval.setRange(1, 60)
+        self.passiveInterval.setValue(1)
+        pl.addWidget(self.passiveInterval)
+        pl.addStretch(1)
+        self.btnPassiveStart = QtWidgets.QPushButton("Start Passive Log")
+        self.btnPassiveStop = QtWidgets.QPushButton("Stop")
+        self.btnPassiveStop.setEnabled(False)
+        pl.addWidget(self.btnPassiveStart)
+        pl.addWidget(self.btnPassiveStop)
+        rightLay.addWidget(passiveGroup)
+
         # ==========================
         # Right pane: Bake Control
         # ==========================
@@ -567,6 +583,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stepSeconds.setRange(1, 600)
         self.stepSeconds.setValue(10)
         headerLay.addWidget(self.stepSeconds)
+        self.chkPassiveCool = QtWidgets.QCheckBox("Passive cooling (fan off)")
+        self.chkPassiveCool.setChecked(True)
+        headerLay.addWidget(self.chkPassiveCool)
         # Calibration Run button (inserted before Run Built Profile)
         self.btnRunCalib = QtWidgets.QPushButton("Calibration Run")
         headerLay.addWidget(self.btnRunCalib)
@@ -593,27 +612,48 @@ class MainWindow(QtWidgets.QMainWindow):
         mlay.addWidget(self.btnManualStop)
         rightLay.addWidget(manualGroup)
 
-        # Live telemetry labels
+        # Live telemetry labels (compact grid)
         tele = QtWidgets.QGroupBox("Live Telemetry")
         tlay = QtWidgets.QGridLayout(tele)
+        tlay.setHorizontalSpacing(12)
+        tlay.setVerticalSpacing(6)
+
         def mkbig(lbl: str):
-            lab = QtWidgets.QLabel(lbl); f = lab.font(); f.setPointSize(12); f.setBold(True); lab.setFont(f)
+            lab = QtWidgets.QLabel(lbl)
+            f = lab.font(); f.setPointSize(12); f.setBold(True); lab.setFont(f)
             lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
             return lab
+
+        # Value labels
         self.tSet = mkbig("—"); self.tActual = mkbig("—"); self.tCJ = mkbig("—")
         self.tHeat = mkbig("—"); self.tFan = mkbig("—"); self.tMode = mkbig("—")
         self.t0 = mkbig("—"); self.t1 = mkbig("—"); self.t2 = mkbig("—"); self.t3 = mkbig("—")
-        row = 0
-        tlay.addWidget(QtWidgets.QLabel("Set (°C):"), row, 0); tlay.addWidget(self.tSet, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Actual (°C):"), row, 0); tlay.addWidget(self.tActual, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Cold Jct (°C):"), row, 0); tlay.addWidget(self.tCJ, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Heat:"), row, 0); tlay.addWidget(self.tHeat, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Fan:"), row, 0); tlay.addWidget(self.tFan, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Mode:"), row, 0); tlay.addWidget(self.tMode, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Temp0 (°C):"), row, 0); tlay.addWidget(self.t0, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Temp1 (°C):"), row, 0); tlay.addWidget(self.t1, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Temp2 (°C):"), row, 0); tlay.addWidget(self.t2, row, 1); row += 1
-        tlay.addWidget(QtWidgets.QLabel("Temp3 (°C):"), row, 0); tlay.addWidget(self.t3, row, 1); row += 1
+
+        # Helper to add a label/value pair at (row, colPairIndex)
+        def add_pair(title: str, widget: QtWidgets.QLabel, row: int, pair_col: int):
+            c = pair_col * 2
+            tlay.addWidget(QtWidgets.QLabel(title), row, c)
+            tlay.addWidget(widget, row, c + 1)
+
+        # Row 0: key setpoint/actual/cold junction
+        add_pair("Set (°C):",    self.tSet,    0, 0)
+        add_pair("Actual (°C):", self.tActual, 0, 1)
+        add_pair("Cold Jct (°C):", self.tCJ,   0, 2)
+
+        # Row 1: outputs and mode
+        add_pair("Heat:", self.tHeat, 1, 0)
+        add_pair("Fan:",  self.tFan,  1, 1)
+        add_pair("Mode:", self.tMode, 1, 2)
+
+        # Row 2: sensors 0–2
+        add_pair("Temp0 (°C):", self.t0, 2, 0)
+        add_pair("Temp1 (°C):", self.t1, 2, 1)
+        add_pair("Temp2 (°C):", self.t2, 2, 2)
+
+        # Row 3: sensor 3 (leave rest empty but keep columns aligned)
+        add_pair("Temp3 (°C):", self.t3, 3, 0)
+        tlay.setColumnStretch(6, 1)  # allow some breathing room on the right
+
         rightLay.addWidget(tele)
         # Prevent the telemetry section from stretching vertically
         tele.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
@@ -738,6 +778,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnManualStart.clicked.connect(self.on_manual_start)
         self.btnManualStop.clicked.connect(self.on_manual_stop)
         self.btnSaveTelemetry.clicked.connect(self.on_save_telemetry_csv)
+        self.chkPassiveCool.toggled.connect(self.on_passive_cool_toggled)
+        # Passive datalogging signals
+        self.btnPassiveStart.clicked.connect(self.on_passive_start)
+        self.btnPassiveStop.clicked.connect(self.on_passive_stop)
         # Series visibility toggles
         for chk in (self.chkShowActual, self.chkShowTarget, self.chkShowSet,
                     self.chkShowT0, self.chkShowT1, self.chkShowT2, self.chkShowT3,
@@ -764,12 +808,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, '_serial_inited', False):
             return
         self._serial_inited = True
+        # Passive cooling preference (runtime flag, default True)
+        self._passive_cool = True
         # Bake profile runner
         self.btnRunBuilt.clicked.connect(self.on_run_built_profile)
         self.btnAbortRun.clicked.connect(self.on_abort_run_profile)
         self.btnRunCalib.clicked.connect(self.on_run_calibration)
         self.profileTimer = QtCore.QTimer(self)
         self.profileTimer.timeout.connect(self.on_profile_tick)
+        # Passive datalogging timer
+        self.passiveTimer = QtCore.QTimer(self)
+        self.passiveTimer.timeout.connect(lambda: self.send_ascii("values"))
+        self._passive_active = False
+        self._pv_acc = {}
         self._run_queue: List[int] = []
         self._run_index: int = 0
         self._run_kind: Optional[str] = None  # 'auto' for built profile, 'calib' for calibration
@@ -817,6 +868,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return []
         return [int(round(v)) for v in Ts]
 
+    def build_seq_from_temps(self, temps: List[int], step_s: int) -> List[Tuple[int,int]]:
+        """Group consecutive identical setpoints into (setpoint, duration_s) segments."""
+        if not temps:
+            return []
+        seq: List[Tuple[int,int]] = []
+        cur = temps[0]
+        run = 1
+        for v in temps[1:]:
+            if v == cur:
+                run += 1
+            else:
+                seq.append((int(cur), int(run * step_s)))
+                cur = v
+                run = 1
+        seq.append((int(cur), int(run * step_s)))
+        return seq
+
     def on_run_built_profile(self):
         if self.worker is None:
             self.log("[UI] Not connected")
@@ -836,14 +904,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if step_s <= 0:
             self.log("[UI] Step seconds must be > 0")
             return
-        self._run_queue = temps
+        # Reassert passive cooling preference before run starts
+        val = 1 if getattr(self, '_passive_cool', True) else 0
+        self.send_ascii(f"setting 229 {val}")
+        # Coalesce identical temps into (setpoint, duration_s) segments
+        self._seq_queue = self.build_seq_from_temps(temps, step_s)
         self._run_index = 0
-        self._run_kind = 'auto'
+        self._run_kind = 'auto'  # reuse auto kind but drive with _seq_queue
         self.transition('START_AUTO')
-        # Kick off immediately then every step_s seconds
+        # Kick off immediately then wait the duration of each segment
         self.on_profile_tick()
-        self.profileTimer.start(step_s * 1000)
-        self.log(f"[RUN] Built profile: {len(temps)} steps @ {step_s}s each")
+        self.log(f"[RUN] Built profile (coalesced): {len(self._seq_queue)} segments from {len(temps)} steps")
 
     def on_abort_run_profile(self):
         self.transition('ABORT_AUTO')
@@ -870,6 +941,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.state.mode == 'auto':
             self.on_abort_run_profile()
         sp = int(self.manualSetpoint.value())
+        # Reassert passive cooling preference before starting manual bake
+        val = 1 if getattr(self, '_passive_cool', True) else 0
+        self.send_ascii(f"setting 229 {val}")
         try:
             # Continuous bake at setpoint (no time argument)
             self.send_ascii(f"bake {sp}")
@@ -905,6 +979,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_profile_tick(self):
         if self.state.mode != 'auto':
             return
+        # If we have a coalesced sequence (auto from built profile), use it
+        if self._run_kind == 'auto' and self._seq_queue:
+            if self._run_index >= len(self._seq_queue):
+                self.profileTimer.stop()
+                try:
+                    self.send_ascii("stop")
+                except Exception:
+                    pass
+                self.transition('AUTO_COMPLETE')
+                self.log("[RUN] Complete")
+                self._run_kind = None
+                self._seq_queue.clear()
+                return
+            setp, dur = self._seq_queue[self._run_index]
+            self.send_ascii(f"bake {setp} {int(dur)}")
+            self._run_index += 1
+            self.profileTimer.start(int(dur * 1000))
+            self.transition('AUTO_STEP_TICK', index=self._run_index)
+            return
         # Calibration run with variable durations
         if self._run_kind == 'calib':
             if self._run_index >= len(self._seq_queue):
@@ -924,10 +1017,9 @@ class MainWindow(QtWidgets.QMainWindow):
             setp, dur = self._seq_queue[self._run_index]
             self.send_ascii(f"bake {setp} {int(dur)}")
             self._run_index += 1
-            # Wait exactly the specified duration before next step
             self.profileTimer.start(int(dur * 1000))
             return
-        # Built-profile auto run (uniform step time)
+        # Fallback: legacy per-step driver (shouldn't be reached once coalescing is used)
         if self._run_index >= len(self._run_queue):
             self.profileTimer.stop()
             try:
@@ -1021,6 +1113,47 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self.vb2.setYRange(0, 255, padding=0)
+        # If we just configured the telemetry plot while passive logging is active, re-apply any expanded x-range
+        if hasattr(self, 'telePlot') and pw is self.telePlot and getattr(self, '_passive_active', False):
+            last_t = self.t0s[-1] if getattr(self, 't0s', []) else 0.0
+            self.ensure_telemetry_x_range(last_t)
+
+    def ensure_telemetry_x_range(self, tsec: float):
+        """If passive datalogging is active and time exceeds 420s, expand x-range and limits.
+        Keeps Y at 0..300 and updates aspect ratio accordingly. Also relocks the secondary axis."""
+        try:
+            if not getattr(self, '_passive_active', False):
+                return
+            if not hasattr(self, 'telePlot'):
+                return
+            if tsec <= 420:
+                return
+            # Round up to the next full minute for a clean axis stop
+            import math
+            new_xmax = max(420, int(math.ceil(tsec / 60.0) * 60))
+            vb = self.telePlot.getViewBox()
+            # Update limits and displayed range to 0..new_xmax
+            try:
+                vb.enableAutoRange(x=False, y=False)
+            except Exception:
+                pass
+            vb.setLimits(xMin=0, xMax=new_xmax, yMin=0, yMax=300)
+            self.telePlot.setXRange(0, new_xmax, padding=0)
+            self.telePlot.setYRange(0, 300, padding=0)
+            # Update aspect ratio to preserve visual scaling of 300°C relative to the new width
+            try:
+                vb.setAspectLocked(True, 300.0 / float(new_xmax))
+            except Exception:
+                pass
+            # Keep the right-side secondary axis aligned
+            if hasattr(self, 'vb2'):
+                try:
+                    self.vb2.enableAutoRange(y=False)
+                except Exception:
+                    pass
+                self.vb2.setYRange(0, 255, padding=0)
+        except Exception:
+            pass
 
     def update_secondary_viewbox(self):
         """Keep right-side output axis aligned and fixed to 0..255."""
@@ -1040,6 +1173,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Derive all UI enablement from the single source of truth: self.state."""
         is_conn = (self.state.conn == 'connected')
         is_conn_or_connecting = self.state.conn in ('connected', 'connecting')
+        if hasattr(self, 'chkPassiveCool'):
+            self.chkPassiveCool.setEnabled(is_conn)
 
         # Connection widgets
         self.connectBtn.setEnabled(self.state.conn == 'disconnected')
@@ -1069,6 +1204,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.manualSetpoint.setEnabled(is_conn and not auto_active)
         self.btnManualStart.setEnabled(is_conn and not auto_active)
         self.btnManualStop.setEnabled(is_conn and manual_active)
+
+        # Passive datalogging enablement (only when connected and not running)
+        passive_ok = is_conn and (self.state.mode == 'idle')
+        self.passiveInterval.setEnabled(passive_ok and not self._passive_active)
+        self.btnPassiveStart.setEnabled(passive_ok and not self._passive_active)
+        self.btnPassiveStop.setEnabled(passive_ok and self._passive_active)
 
     def transition(self, event: str, **kwargs):
         """Centralized state transitions. Updates self.state and calls apply_state()."""
@@ -1347,6 +1488,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_conn_changed(self, ok: bool):
         self.transition('CONNECTED' if ok else 'DISCONNECTED')
+        if ok:
+            val = 1 if getattr(self, '_passive_cool', True) else 0
+            self.send_ascii(f"setting 229 {val}")
+            
+    def on_passive_cool_toggled(self, checked: bool):
+        """Push runtime flag to firmware via 'setting <id> <value>' and cache locally.
+        Firmware expects NV id 229 (0xE5) for DisableFanCool.
+        """
+        self._passive_cool = bool(checked)
+        if self.worker is not None:
+            try:
+                val = 1 if checked else 0
+                self.send_ascii(f"setting 229 {val}")
+            except Exception as e:
+                self.log(f"[ERR] passive-cool toggle: {e}")
 
     @QtCore.pyqtSlot(bytes)
     def on_rx_raw(self, data: bytes):
@@ -1386,6 +1542,24 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(str)
     def on_rx_text(self, line: str):
         sline = line.strip()
+        # Passive 'values' block parsing (multiline):
+        if sline.startswith('Actual measured values'):
+            self._pv_acc = {}
+        elif sline.startswith('Left:') or sline.startswith('Right:') or sline.startswith('Cold junction:'):
+            try:
+                txt = sline.replace('degC', '').strip()
+                if txt.startswith('Left:'):
+                    self._pv_acc['left'] = float(txt.split(':',1)[1])
+                elif txt.startswith('Right:'):
+                    self._pv_acc['right'] = float(txt.split(':',1)[1])
+                elif txt.startswith('Cold junction:'):
+                    self._pv_acc['cj'] = float(txt.split(':',1)[1])
+            except Exception:
+                pass
+            # When we have all three, ingest a passive sample
+            if all(k in self._pv_acc for k in ('left','right','cj')):
+                self.ingest_passive_values(self._pv_acc)
+                self._pv_acc = {}
         # Telemetry header or auto-bootstrap
         if sline.startswith("# Time,"):
             hdr = [h.strip() for h in sline.lstrip('#').split(',')]
@@ -1407,6 +1581,71 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.update_telemetry_from_parts(parts)
         if not self.rxHexChk.isChecked():
             self.log(line)
+
+    def on_passive_start(self):
+        if self.worker is None:
+            self.log("[UI] Not connected")
+            return
+        if self.state.mode != 'idle':
+            QtWidgets.QMessageBox.information(self, "Busy", "Stop any active run before starting passive logging.")
+            return
+        # Fresh buffers for a clean CSV
+        self._t0_epoch = None
+        self.t0s.clear(); self.actuals.clear(); self.setpoints.clear()
+        self.t0_list.clear(); self.t1_list.clear(); self.t2_list.clear(); self.t3_list.clear()
+        self.heat_list.clear(); self.fan_list.clear(); self.teleRows.clear()
+        # Kick an immediate sample, then periodic polling
+        self._pv_acc = {}
+        self._passive_active = True
+        self.apply_state()
+        self.send_ascii("values")
+        self.passiveTimer.start(int(self.passiveInterval.value()) * 1000)
+        self.log("[PASSIVE] Datalogging started")
+
+    def on_passive_stop(self):
+        if not self._passive_active:
+            return
+        try:
+            self.passiveTimer.stop()
+        except Exception:
+            pass
+        self._passive_active = False
+        self.apply_state()
+        self.log("[PASSIVE] Datalogging stopped")
+
+    def ingest_passive_values(self, acc: dict):
+        """Append a passive sample (avg of left/right) into the telemetry buffers and update plot."""
+        try:
+            left = float(acc.get('left'))
+            right = float(acc.get('right'))
+            cj = float(acc.get('cj'))
+        except Exception:
+            return
+        actual = (left + right) / 2.0
+        now = datetime.now().timestamp()
+        if getattr(self, '_t0_epoch', None) is None:
+            self._t0_epoch = now
+        tsec = now - float(self._t0_epoch)
+        # Append to buffers
+        self.t0s.append(tsec)
+        self.actuals.append(actual)
+        self.setpoints.append(None)
+        self.t0_list.append(left)
+        self.t1_list.append(right)
+        self.t2_list.append(None)
+        self.t3_list.append(None)
+        self.heat_list.append(None)
+        self.fan_list.append(None)
+        iso = datetime.fromtimestamp(now).isoformat(timespec='milliseconds')
+        self.teleRows.append((
+            iso, float(tsec), None, actual, cj, None, None, 'PASSIVE',
+            left, right, None, None
+        ))
+        # Push to plot
+        self.update_telemetry_curves()
+        # Expand X range beyond 420s during passive logging
+        self.ensure_telemetry_x_range(tsec)
+        self.configure_plot_axes(self.telePlot, disable_mouse=False)
 
     def update_telemetry_from_parts(self, parts: List[str]):
         def getf(name: str):

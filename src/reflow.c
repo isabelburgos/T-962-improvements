@@ -44,6 +44,15 @@
 #define COOL_HYSTERESIS_C   (4.0f)   // widened deadband for extraction-on operation
 #define FAN_KP              (20.0f)  // reduced proportional gain (extraction increases effective cooling)
 
+// When set to 1, cooling never engages the fan; oven cools passively.
+// Useful when external fume extraction is present and tends to cause overshoot.
+// Runtime-configurable flag stored in NV/EEPROM. Non-zero disables fan during cooling.
+// Written from host via:  setting <id> <value>
+#define NV_ID_DISABLE_FAN_COOL  (0xE5)
+static inline int DisableFanCool(void) {
+    return NV_GetConfig(NV_ID_DISABLE_FAN_COOL) ? 0 : 1;
+}
+
 static PidType PID;
 
 static uint16_t intsetpoint;
@@ -158,7 +167,7 @@ void Reflow_Init(void) {
 	//PID_init(&PID, 20, 0.04, 25, PID_Direction_Direct); // Improvement as far as I can tell, still work in progress
 	PID_init(&PID, 0, 0, 0, PID_Direction_Direct); // Can't supply tuning to PID_Init when not using the default timebase
 	PID_SetSampleTime(&PID, PID_TIMEBASE);
-	PID_SetTunings(&PID, 18, 0.012, 40.0); // Tuned for extraction-on operation: slightly lower Kp/Ki and softer D
+	PID_SetTunings(&PID, 19, 0.012, 40.0); // +1 Kp to reduce steady-state bias under extraction
 	//PID_SetTunings(&PID, 80, 0, 0); // This results in oscillations with 14.5s cycle time
 	//PID_SetTunings(&PID, 30, 0, 0); // This results in oscillations with 14.5s cycle time
 	//PID_SetTunings(&PID, 15, 0, 0);
@@ -175,6 +184,7 @@ void Reflow_Init(void) {
 	Sensor_ValidateNV();
 
 	Reflow_LoadSetpoint();
+	printf("\n PassiveCooling(DisableFanCool) = %d\n", DisableFanCool());
 
 	PID.mySetpoint = (float)SETPOINT_DEFAULT;
 	PID_SetOutputLimits(&PID, 0, 255 + 248);
@@ -312,7 +322,11 @@ int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pf
     const float error = control_setpoint - meastemp;   // + => need heat, - => need cooling
     const uint8_t min_fan = NV_GetConfig(REFLOW_MIN_FAN_SPEED);
 
-    if (error > COOL_HYSTERESIS_C) {
+    // Asymmetric deadband: keep 4°C for cooling, but relax heating threshold to 3°C
+    // except when the profile is descending (to avoid heater kick during cool-down).
+    const float HEAT_DB = (slope_negative ? COOL_HYSTERESIS_C : 3.0f);
+
+    if (error > HEAT_DB) {
         // HEATING region (fan at minimum, no reverse fan usage)
         PID_SetMode(&PID, PID_Mode_Automatic);
         PID.myInput = meastemp;
@@ -322,20 +336,22 @@ int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pf
         *pheat = (uint8_t)(out - 248);       // 0..255
         *pfan  = min_fan;                    // low, fixed airflow during heating
 
-    } else if (error < -COOL_HYSTERESIS_C) {
-        // COOLING region (heater off). Use a simple proportional fan control.
-        PID_SetMode(&PID, PID_Mode_Manual);   // prevent I-term windup during explicit cooling
-        *pheat = 0;
-        float cool_e = -error; // degrees above setpoint
-        int fan = (int)(min_fan + FAN_KP * cool_e);
-        if (slope_negative && fan < 120) fan = 120;  // ensure useful airflow when profile is descending
-        if (fan > 255) fan = 255;
-        if (fan < 0)   fan = 0;
-        *pfan = (uint8_t)fan;
+	} else if (error < -COOL_HYSTERESIS_C) {
+		// COOLING (heater off)
+		PID_SetMode(&PID, PID_Mode_Manual);
+		*pheat = 0;
 
-        // Keep PID from winding up while we are explicitly cooling: bias output to neutral
-        PID.myOutput = 248;  // mid-point in existing mapping
-
+		if (DisableFanCool()) {
+			// Passive cool-down: no fan
+			*pfan = 0; // or min_fan if you prefer a tiny idle flow
+		} else {
+			float cool_e = -error;
+			int fan = (int)(min_fan + FAN_KP * cool_e);
+			if (fan > 255) fan = 255;
+			if (fan < 0)   fan = 0;
+			*pfan = (uint8_t)fan;
+		}
+		PID.myOutput = 248;   // keep integrator neutral
     } else {
         // DEADBAND region: avoid fighting around the setpoint
         PID_SetMode(&PID, PID_Mode_Manual);   // hold integrator steady in deadband
