@@ -343,7 +343,7 @@ int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pf
 
 		if (DisableFanCool()) {
 			// Passive cool-down: no fan
-			*pfan = 0; // or min_fan if you prefer a tiny idle flow
+			*pfan = min_fan; // or min_fan if you prefer a tiny idle flow
 		} else {
 			float cool_e = -error;
 			int fan = (int)(min_fan + FAN_KP * cool_e);
